@@ -124,22 +124,43 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return
 
+    # 1. Шаг проверки возраста
+    await state.set_state(LobbyStates.step_age)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔞 Мне есть 18 лет", callback_data="age_ok"),
+            InlineKeyboardButton(text="❌ Мне нет 18", callback_data="age_fail")
+        ]
+    ])
+    await message.answer("🏛 <b>Добро пожаловать в лобби PARLIAMENT.</b>\n\nПодтвердите ваш возраст:", parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Выберите вариант:", reply_markup=kb)
+
+@router.callback_query(LobbyStates.step_age, F.data.in_({"age_ok", "age_fail"}))
+async def process_age(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.data == "age_fail":
+        await state.clear()
+        await callback.message.edit_text("⛔ <b>Доступ закрыт. Вам нет 18 лет.</b>", parse_mode="HTML")
+        return
+
+    # 2. Шаг правил
     await state.set_state(LobbyStates.step_rules)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📖 Читать правила (Telegraph)", url=TELEGRAPH_RULES_URL)],
         [InlineKeyboardButton(text="✅ Я ознакомился и согласен", callback_data="rules_accepted")]
     ])
-    await message.answer("🏛 <b>Добро пожаловать в лобби PARLIAMENT.</b>\n\nОзнакомьтесь с правилами:", parse_mode="HTML", reply_markup=kb)
+    await callback.message.edit_text("📜 <b>Свод правил PARLIAMENT</b>\n\nОзнакомьтесь с правилами по ссылке ниже:", parse_mode="HTML", reply_markup=kb)
 
 @router.callback_query(LobbyStates.step_rules, F.data == "rules_accepted")
 async def process_rules(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(LobbyStates.step_captcha)
 
+    # 3. Шаг капчи
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🧩 Пройти проверку (Капча)", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
-    await callback.message.edit_text("✔️ <b>Правила подтверждены.</b> Нажмите кнопку ниже для прохождения капчи:", parse_mode="HTML", reply_markup=kb)
+    await callback.message.edit_text("✔️ <b>Возраст и правила подтверждены.</b> Нажмите кнопку ниже для прохождения капчи:", parse_mode="HTML", reply_markup=kb)
 
 async def handle_verify_api(request):
     headers = {
