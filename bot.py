@@ -2,10 +2,8 @@ import os
 import time
 import json
 import sqlite3
-import asyncio
 import logging
 from dotenv import load_dotenv
-from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
@@ -18,6 +16,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
 load_dotenv()
 
@@ -26,6 +26,11 @@ CHAT_ID = int(os.getenv("CHAT_ID"))
 WEBAPP_URL = os.getenv("WEBAPP_URL")
 TELEGRAPH_RULES_URL = os.getenv("RULES_URL", "https://telegra.ph/Pravila-Parliament-01-01")
 PORT = int(os.getenv("PORT", 10000))
+
+# Вставьте ваш боевой URL от Render (тот самый, что заканчивается на .onrender.com)
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://excalibur-6ols.onrender.com")
+WEBHOOK_PATH = f"/bot/{BOT_TOKEN}"
+WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 router = Router()
@@ -152,7 +157,6 @@ async def process_rules(callback: CallbackQuery, state: FSMContext):
     ])
     await callback.message.edit_text("✔️ <b>Возраст и правила подтверждены.</b> Нажмите кнопку ниже:", parse_mode="HTML", reply_markup=kb)
 
-# --- ЛОВИМ ДАННЫЕ ИЗ WEBAPP БЕЗ СТРОГОЙ ПРОВЕРКИ СОСТОЯНИЯ (НАДЕЖНЕЕ) ---
 @router.message(F.web_app_data)
 async def process_captcha(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
@@ -205,27 +209,27 @@ async def process_captcha(message: Message, state: FSMContext, bot: Bot):
         parse_mode="HTML"
     )
 
-async def handle_ping(request):
-    return web.Response(text="Parliament Bot is running!")
+async def on_startup(bot: Bot):
+    await bot.set_webhook(WEBHOOK_URL)
+    logging.info(f"Вебхук успешно установлен на: {WEBHOOK_URL}")
 
-async def web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logging.info(f"Веб-сервер запущен на порту {PORT}")
-
-async def main():
+def main():
     init_db()
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    await web_server()
-    logging.info("Бот PARLIAMENT запущен через Polling!")
-    await dp.start_polling(bot)
+    dp.startup.register(on_startup)
+
+    app = web.Application()
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    )
+    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
