@@ -11,7 +11,6 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
     Message, CallbackQuery, 
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
     WebAppInfo
 )
 from aiogram.filters import CommandStart
@@ -33,24 +32,56 @@ router = Router()
 
 COOLDOWN_SECONDS = 15 * 60  # 15 минут
 
+# --- БАЗА ДАННЫХ И ЛОГИРОВАНИЕ В ФАЙЛ ---
 def init_db():
     with sqlite3.connect("parliament.db") as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
                 is_banned INTEGER DEFAULT 0,
-                last_link_time INTEGER DEFAULT 0
+                last_link_time INTEGER DEFAULT 0,
+                first_seen INTEGER
             )
         """)
         conn.commit()
+
+def log_user_to_file(user_id: int, username: str, full_name: str):
+    """Логирует каждого пользователя в отдельный текстовый файл users_log.txt"""
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    log_line = f"[{timestamp}] ID: {user_id} | Username: @{username or 'нет'} | Name: {full_name}\n"
+    
+    # Проверяем, записан ли уже этот ID в файл, чтобы не плодить дубликаты за один день
+    existing_ids = set()
+    if os.path.exists("users_log.txt"):
+        with open("users_log.txt", "r", encoding="utf-8") as f:
+            existing_ids = {line.split("ID: ")[1].split(" |")[0] for line in f if "ID: " in line}
+            
+    if str(user_id) not in existing_ids:
+        with open("users_log.txt", "a", encoding="utf-8") as f:
+            f.write(log_line)
+
+def upsert_user_db(user_id: int, username: str, full_name: str):
+    with sqlite3.connect("parliament.db") as conn:
+        now = int(time.time())
+        conn.execute("""
+            INSERT INTO users (user_id, username, full_name, is_banned, last_link_time, first_seen)
+            VALUES (?, ?, ?, 0, 0, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                full_name = excluded.full_name
+        """, (user_id, username, full_name, now))
+        conn.commit()
+    
+    # Также записываем в текстовый файл
+    log_user_to_file(user_id, username, full_name)
 
 def get_user_db(user_id: int):
     with sqlite3.connect("parliament.db") as conn:
         cur = conn.execute("SELECT is_banned, last_link_time FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
         if not row:
-            conn.execute("INSERT INTO users (user_id, is_banned, last_link_time) VALUES (?, 0, 0)", (user_id,))
-            conn.commit()
             return {"is_banned": False, "last_link_time": 0}
         return {"is_banned": bool(row[0]), "last_link_time": row[1]}
 
@@ -76,12 +107,16 @@ class LobbyStates(StatesGroup):
     step_rules = State()
     step_captcha = State()
 
+# --- ШАГ 1: /start ---
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
-    user_id = message.from_user.id
+    user = message.from_user
+    user_id = user.id
+    
+    upsert_user_db(user_id, user.username, user.full_name)
 
     if await check_is_banned(bot, user_id):
-        await message.answer("⛔ <b>Вы заблокированы в чате Parliament.</b>", parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+        await message.answer("⛔ <b>Вы заблокированы в чате Parliament.</b>", parse_mode="HTML")
         await state.clear()
         return
 
@@ -92,8 +127,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         await message.answer(
             f"⏳ <b>Вы уже получили персональную ссылку.</b>\n"
             f"Новую можно будет запросить через {rem_min} мин.",
-            parse_mode="HTML",
-            reply_markup=ReplyKeyboardRemove()
+            parse_mode="HTML"
         )
         await state.clear()
         return
@@ -112,6 +146,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         reply_markup=kb
     )
 
+# --- ШАГ 2: ВОЗРАСТ ---
 @router.callback_query(LobbyStates.step_age, F.data.in_({"age_ok", "age_fail"}))
 async def process_age(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -132,42 +167,48 @@ async def process_age(callback: CallbackQuery, state: FSMContext):
         reply_markup=kb
     )
 
+# --- ШАГ 3: ПРАВИЛА -> ИНЛАЙН КНОПКА КАПЧИ ---
 @router.callback_query(LobbyStates.step_rules, F.data == "rules_accepted")
 async def process_rules(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(LobbyStates.step_captcha)
-    await callback.message.edit_text("✔️ <b>Возраст и правила подтверждены.</b>", parse_mode="HTML")
 
-    webapp_kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="🧩 Пройти проверку (Капча)", web_app=WebAppInfo(url=WEBAPP_URL))]],
-        resize_keyboard=True,
-        one_time_keyboard=True
+    # Делаем кнопку капчи ИНЛАЙНОВЫМ ОБРАЗОМ под сообщением (без клавиатуры снизу)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧩 Пройти проверку (Капча)", web_app=WebAppInfo(url=WEBAPP_URL))]
+    ])
+
+    await callback.message.edit_text(
+        "✔️ <b>Возраст и правила подтверждены.</b>\n\n"
+        "🔒 Остался финальный шаг — нажмите кнопку ниже, чтобы пройти антибот-проверку:",
+        parse_mode="HTML",
+        reply_markup=kb
     )
-    await callback.message.answer("👇 Нажмите кнопку ниже и соберите пазл:", reply_markup=webapp_kb)
 
+# --- ШАГ 4: ОБРАБОТКА КАПЧИ И ВЫДАЧА ССЫЛКИ ---
 @router.message(LobbyStates.step_captcha, F.web_app_data)
 async def process_captcha(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
     try:
         payload = json.loads(message.web_app_data.data)
     except Exception:
-        await message.answer("⚠️ Ошибка чтения данных.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("⚠️ Ошибка чтения данных.")
         return
 
     if payload.get("status") != "verified":
-        await message.answer("❌ Проверка не пройдена.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("❌ Проверка не пройдена.")
         await state.clear()
         return
 
     if await check_is_banned(bot, user_id):
-        await message.answer("⛔ <b>Вы заблокированы.</b>", parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+        await message.answer("⛔ <b>Вы заблокированы.</b>", parse_mode="HTML")
         await state.clear()
         return
 
     user_data = get_user_db(user_id)
     now = int(time.time())
     if now - user_data["last_link_time"] < COOLDOWN_SECONDS:
-        await message.answer("⏳ Кулдаун еще не прошел.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("⏳ Кулдаун еще не прошел.")
         await state.clear()
         return
 
@@ -181,7 +222,7 @@ async def process_captcha(message: Message, state: FSMContext, bot: Bot):
         )
     except Exception as e:
         logging.error(f"Ошибка создания ссылки: {e}")
-        await message.answer("⚠️ Ошибка создания ссылки со стороны Telegram.", reply_markup=ReplyKeyboardRemove())
+        await message.answer("⚠️ Ошибка создания ссылки со стороны Telegram.")
         return
 
     update_cooldown_db(user_id, now)
@@ -191,8 +232,7 @@ async def process_captcha(message: Message, state: FSMContext, bot: Bot):
         "✅ <b>Проверка пройдена! Доступ открыт.</b>\n\n"
         f"🔗 Ваша одноразовая ссылка:\n{invite.invite_link}\n\n"
         "<i>⚠️ Ссылка сгорит через 15 минут или после 1 входа.</i>",
-        parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove()
+        parse_mode="HTML"
     )
 
 async def handle_ping(request):
