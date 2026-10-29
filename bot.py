@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (
     Message, CallbackQuery, 
     InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardRemove,
     WebAppInfo
 )
 from aiogram.filters import CommandStart
@@ -27,13 +28,13 @@ WEBAPP_URL = os.getenv("WEBAPP_URL")
 TELEGRAPH_RULES_URL = os.getenv("RULES_URL", "https://telegra.ph/Pravila-Parliament-01-01")
 PORT = int(os.getenv("PORT", 10000))
 
-# Вставьте ваш боевой URL от Render (тот самый, что заканчивается на .onrender.com)
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://excalibur-6ols.onrender.com")
 WEBHOOK_PATH = f"/bot/{BOT_TOKEN}"
 WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 router = Router()
+bot_global = Bot(token=BOT_TOKEN)
 
 COOLDOWN_SECONDS = 15 * 60
 
@@ -111,7 +112,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     upsert_user_db(user.id, user.username, user.full_name)
 
     if await check_is_banned(bot, user.id):
-        await message.answer("⛔ <b>Вы заблокированы в чате Parliament.</b>", parse_mode="HTML")
+        await message.answer("⛔ <b>Вы заблокированы в чате Parliament.</b>", parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
         await state.clear()
         return
 
@@ -119,25 +120,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     now = int(time.time())
     if now - user_data["last_link_time"] < COOLDOWN_SECONDS:
         rem_min = ((COOLDOWN_SECONDS - (now - user_data["last_link_time"])) // 60) + 1
-        await message.answer(f"⏳ <b>Вы уже получили персональную ссылку.</b> Снова через {rem_min} мин.", parse_mode="HTML")
+        await message.answer(f"⏳ <b>Вы уже получили персональную ссылку.</b> Снова через {rem_min} мин.", parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
         await state.clear()
-        return
-
-    await state.set_state(LobbyStates.step_age)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🔞 Мне есть 18 лет", callback_data="age_ok"),
-            InlineKeyboardButton(text="❌ Мне нет 18", callback_data="age_fail")
-        ]
-    ])
-    await message.answer("🏛 <b>Добро пожаловать в лобби PARLIAMENT.</b>\n\nПодтвердите ваш возраст:", parse_mode="HTML", reply_markup=kb)
-
-@router.callback_query(LobbyStates.step_age, F.data.in_({"age_ok", "age_fail"}))
-async def process_age(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if callback.data == "age_fail":
-        await state.clear()
-        await callback.message.edit_text("⛔ <b>Доступ закрыт.</b>", parse_mode="HTML")
         return
 
     await state.set_state(LobbyStates.step_rules)
@@ -145,7 +129,7 @@ async def process_age(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="📖 Читать правила (Telegraph)", url=TELEGRAPH_RULES_URL)],
         [InlineKeyboardButton(text="✅ Я ознакомился и согласен", callback_data="rules_accepted")]
     ])
-    await callback.message.edit_text("📜 <b>Свод правил PARLIAMENT</b>", parse_mode="HTML", reply_markup=kb)
+    await message.answer("🏛 <b>Добро пожаловать в лобби PARLIAMENT.</b>\n\nОзнакомьтесь с правилами:", parse_mode="HTML", reply_markup=kb)
 
 @router.callback_query(LobbyStates.step_rules, F.data == "rules_accepted")
 async def process_rules(callback: CallbackQuery, state: FSMContext):
@@ -155,59 +139,57 @@ async def process_rules(callback: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🧩 Пройти проверку (Капча)", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
-    await callback.message.edit_text("✔️ <b>Возраст и правила подтверждены.</b> Нажмите кнопку ниже:", parse_mode="HTML", reply_markup=kb)
+    await callback.message.edit_text("✔️ <b>Правила подтверждены.</b> Нажмите кнопку ниже для прохождения капчи:", parse_mode="HTML", reply_markup=kb)
 
-@router.message(F.web_app_data)
-async def process_captcha(message: Message, state: FSMContext, bot: Bot):
-    user_id = message.from_user.id
-    logging.info(f"Получены данные из WebApp от юзера {user_id}: {message.web_app_data.data}")
-
+# --- ОБРАБОТЧИК ПРЯМОГО ЗАПРОСА ОТ МИНИ-ПРИЛОЖЕНИЯ ---
+async def handle_verify_api(request):
     try:
-        payload = json.loads(message.web_app_data.data)
-    except Exception as e:
-        logging.error(f"Ошибка парсинга JSON от WebApp: {e}")
-        await message.answer("⚠️ Ошибка чтения данных капчи.")
-        return
+        data = await request.json()
+        user_id = int(data.get("user_id"))
+    except Exception:
+        return web.json_response({"success": False, "error": "Неверные данные"}, status=400)
 
-    if payload.get("status") != "verified":
-        await message.answer("❌ Проверка не пройдена.")
-        await state.clear()
-        return
-
-    if await check_is_banned(bot, user_id):
-        await message.answer("⛔ <b>Вы заблокированы.</b>", parse_mode="HTML")
-        await state.clear()
-        return
+    if await check_is_banned(bot_global, user_id):
+        return web.json_response({"success": False, "error": "Вы заблокированы"}, status=403)
 
     user_data = get_user_db(user_id)
     now = int(time.time())
     if now - user_data["last_link_time"] < COOLDOWN_SECONDS:
-        await message.answer("⏳ Кулдаун еще не прошел.")
-        await state.clear()
-        return
+        return web.json_response({"success": False, "error": "Кулдаун не прошел"}, status=429)
 
     try:
         expire_timestamp = now + COOLDOWN_SECONDS
-        invite = await bot.create_chat_invite_link(
+        invite = await bot_global.create_chat_invite_link(
             chat_id=CHAT_ID,
             name=f"User_{user_id}",
             expire_date=expire_timestamp,
             member_limit=1
         )
     except Exception as e:
-        logging.error(f"Ошибка создания ссылки: {e}")
-        await message.answer("⚠️ Ошибка создания ссылки со стороны Telegram (проверьте права админа у бота в чате).")
-        return
+        logging.error(f"Ошибка создания ссылки через API: {e}")
+        return web.json_response({"success": False, "error": "Ошибка генерации ссылки Telegram"}, status=500)
 
     update_cooldown_db(user_id, now)
-    await state.clear()
 
-    await message.answer(
-        "✅ <b>Проверка пройдена! Доступ открыт.</b>\n\n"
-        f"🔗 Ваша одноразовая ссылка:\n{invite.invite_link}\n\n"
-        "<i>⚠️ Ссылка сгорит через 15 минут или после 1 входа.</i>",
-        parse_mode="HTML"
-    )
+    # Отправляем ссылку пользователю в ЛС от имени бота
+    try:
+        await bot_global.send_message(
+            chat_id=user_id,
+            text=(
+                "✅ <b>Проверка успешно пройдена! Доступ открыт.</b>\n\n"
+                f"🔗 Ваша одноразовая ссылка:\n{invite.invite_link}\n\n"
+                "<i>⚠️ Ссылка сгорит через 15 минут или после 1 входа.</i>"
+            ),
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    except Exception as e:
+        logging.error(f"Не удалось отправить сообщение юзеру {user_id}: {e}")
+
+    return web.json_response({"success": True})
+
+async def handle_ping(request):
+    return web.Response(text="Parliament Bot is running!")
 
 async def on_startup(bot: Bot):
     await bot.set_webhook(WEBHOOK_URL)
@@ -215,19 +197,23 @@ async def on_startup(bot: Bot):
 
 def main():
     init_db()
-    bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
     dp.startup.register(on_startup)
 
     app = web.Application()
+    
+    # Роуты веб-сервера
+    app.router.add_get("/", handle_ping)
+    app.router.add_post("/api/verify", handle_verify_api)
+
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
-        bot=bot,
+        bot=bot_global,
     )
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
+    setup_application(app, dp, bot=bot_global)
 
     web.run_app(app, host="0.0.0.0", port=PORT)
 
