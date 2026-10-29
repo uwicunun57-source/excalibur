@@ -3,6 +3,8 @@ import time
 import json
 import sqlite3
 import logging
+import asyncio
+import aiohttp
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -124,7 +126,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return
 
-    # 1. Шаг проверки возраста
+    # Шаг 1: Возраст
     await state.set_state(LobbyStates.step_age)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -143,7 +145,7 @@ async def process_age(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("⛔ <b>Доступ закрыт. Вам нет 18 лет.</b>", parse_mode="HTML")
         return
 
-    # 2. Шаг правил
+    # Шаг 2: Правила
     await state.set_state(LobbyStates.step_rules)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📖 Читать правила (Telegraph)", url=TELEGRAPH_RULES_URL)],
@@ -156,7 +158,7 @@ async def process_rules(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(LobbyStates.step_captcha)
 
-    # 3. Шаг капчи
+    # Шаг 3: Капча
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🧩 Пройти проверку (Капча)", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
@@ -219,9 +221,22 @@ async def handle_verify_api(request):
 async def handle_ping(request):
     return web.Response(text="Parliament Bot is running!")
 
+# Фоновый пингер, чтобы Render не засыпал
+async def keep_alive():
+    await asyncio.sleep(10)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(RENDER_EXTERNAL_URL) as resp:
+                    pass
+            except Exception:
+                pass
+            await asyncio.sleep(240) # Пингуем каждые 4 минуты
+
 async def on_startup(bot: Bot):
     await bot.set_webhook(WEBHOOK_URL)
     logging.info(f"Вебхук успешно установлен на: {WEBHOOK_URL}")
+    asyncio.create_task(keep_alive())
 
 def main():
     init_db()
