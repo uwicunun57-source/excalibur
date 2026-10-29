@@ -141,21 +141,29 @@ async def process_rules(callback: CallbackQuery, state: FSMContext):
     ])
     await callback.message.edit_text("✔️ <b>Правила подтверждены.</b> Нажмите кнопку ниже для прохождения капчи:", parse_mode="HTML", reply_markup=kb)
 
-# --- ОБРАБОТЧИК ПРЯМОГО ЗАПРОСА ОТ МИНИ-ПРИЛОЖЕНИЯ ---
 async def handle_verify_api(request):
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    }
+    
+    if request.method == "OPTIONS":
+        return web.Response(status=200, headers=headers)
+
     try:
         data = await request.json()
         user_id = int(data.get("user_id"))
     except Exception:
-        return web.json_response({"success": False, "error": "Неверные данные"}, status=400)
+        return web.json_response({"success": False, "error": "Неверные данные"}, status=400, headers=headers)
 
     if await check_is_banned(bot_global, user_id):
-        return web.json_response({"success": False, "error": "Вы заблокированы"}, status=403)
+        return web.json_response({"success": False, "error": "Вы заблокированы"}, status=403, headers=headers)
 
     user_data = get_user_db(user_id)
     now = int(time.time())
     if now - user_data["last_link_time"] < COOLDOWN_SECONDS:
-        return web.json_response({"success": False, "error": "Кулдаун не прошел"}, status=429)
+        return web.json_response({"success": False, "error": "Кулдаун не прошел"}, status=429, headers=headers)
 
     try:
         expire_timestamp = now + COOLDOWN_SECONDS
@@ -167,11 +175,10 @@ async def handle_verify_api(request):
         )
     except Exception as e:
         logging.error(f"Ошибка создания ссылки через API: {e}")
-        return web.json_response({"success": False, "error": "Ошибка генерации ссылки Telegram"}, status=500)
+        return web.json_response({"success": False, "error": "Ошибка генерации ссылки Telegram"}, status=500, headers=headers)
 
     update_cooldown_db(user_id, now)
 
-    # Отправляем ссылку пользователю в ЛС от имени бота
     try:
         await bot_global.send_message(
             chat_id=user_id,
@@ -186,7 +193,7 @@ async def handle_verify_api(request):
     except Exception as e:
         logging.error(f"Не удалось отправить сообщение юзеру {user_id}: {e}")
 
-    return web.json_response({"success": True})
+    return web.json_response({"success": True}, headers=headers)
 
 async def handle_ping(request):
     return web.Response(text="Parliament Bot is running!")
@@ -204,9 +211,9 @@ def main():
 
     app = web.Application()
     
-    # Роуты веб-сервера
     app.router.add_get("/", handle_ping)
     app.router.add_post("/api/verify", handle_verify_api)
+    app.router.add_options("/api/verify", handle_verify_api)
 
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
