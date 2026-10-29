@@ -30,9 +30,8 @@ PORT = int(os.getenv("PORT", 10000))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 router = Router()
 
-COOLDOWN_SECONDS = 15 * 60  # 15 минут
+COOLDOWN_SECONDS = 15 * 60
 
-# --- БАЗА ДАННЫХ И ЛОГИРОВАНИЕ В ФАЙЛ ---
 def init_db():
     with sqlite3.connect("parliament.db") as conn:
         conn.execute("""
@@ -48,16 +47,12 @@ def init_db():
         conn.commit()
 
 def log_user_to_file(user_id: int, username: str, full_name: str):
-    """Логирует каждого пользователя в отдельный текстовый файл users_log.txt"""
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     log_line = f"[{timestamp}] ID: {user_id} | Username: @{username or 'нет'} | Name: {full_name}\n"
-    
-    # Проверяем, записан ли уже этот ID в файл, чтобы не плодить дубликаты за один день
     existing_ids = set()
     if os.path.exists("users_log.txt"):
         with open("users_log.txt", "r", encoding="utf-8") as f:
             existing_ids = {line.split("ID: ")[1].split(" |")[0] for line in f if "ID: " in line}
-            
     if str(user_id) not in existing_ids:
         with open("users_log.txt", "a", encoding="utf-8") as f:
             f.write(log_line)
@@ -73,8 +68,6 @@ def upsert_user_db(user_id: int, username: str, full_name: str):
                 full_name = excluded.full_name
         """, (user_id, username, full_name, now))
         conn.commit()
-    
-    # Также записываем в текстовый файл
     log_user_to_file(user_id, username, full_name)
 
 def get_user_db(user_id: int):
@@ -107,28 +100,21 @@ class LobbyStates(StatesGroup):
     step_rules = State()
     step_captcha = State()
 
-# --- ШАГ 1: /start ---
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     user = message.from_user
-    user_id = user.id
-    
-    upsert_user_db(user_id, user.username, user.full_name)
+    upsert_user_db(user.id, user.username, user.full_name)
 
-    if await check_is_banned(bot, user_id):
+    if await check_is_banned(bot, user.id):
         await message.answer("⛔ <b>Вы заблокированы в чате Parliament.</b>", parse_mode="HTML")
         await state.clear()
         return
 
-    user_data = get_user_db(user_id)
+    user_data = get_user_db(user.id)
     now = int(time.time())
     if now - user_data["last_link_time"] < COOLDOWN_SECONDS:
         rem_min = ((COOLDOWN_SECONDS - (now - user_data["last_link_time"])) // 60) + 1
-        await message.answer(
-            f"⏳ <b>Вы уже получили персональную ссылку.</b>\n"
-            f"Новую можно будет запросить через {rem_min} мин.",
-            parse_mode="HTML"
-        )
+        await message.answer(f"⏳ <b>Вы уже получили персональную ссылку.</b> Снова через {rem_min} мин.", parse_mode="HTML")
         await state.clear()
         return
 
@@ -139,14 +125,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
             InlineKeyboardButton(text="❌ Мне нет 18", callback_data="age_fail")
         ]
     ])
-    await message.answer(
-        "🏛 <b>Добро пожаловать в лобби PARLIAMENT.</b>\n\n"
-        "Подтвердите, что вам уже исполнилось 18 лет:",
-        parse_mode="HTML",
-        reply_markup=kb
-    )
+    await message.answer("🏛 <b>Добро пожаловать в лобби PARLIAMENT.</b>\n\nПодтвердите ваш возраст:", parse_mode="HTML", reply_markup=kb)
 
-# --- ШАГ 2: ВОЗРАСТ ---
 @router.callback_query(LobbyStates.step_age, F.data.in_({"age_ok", "age_fail"}))
 async def process_age(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -160,39 +140,29 @@ async def process_age(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="📖 Читать правила (Telegraph)", url=TELEGRAPH_RULES_URL)],
         [InlineKeyboardButton(text="✅ Я ознакомился и согласен", callback_data="rules_accepted")]
     ])
-    await callback.message.edit_text(
-        "📜 <b>Свод правил PARLIAMENT</b>\n\n"
-        "Ознакомьтесь с регламентом сообщества и нажмите кнопку ниже:",
-        parse_mode="HTML",
-        reply_markup=kb
-    )
+    await callback.message.edit_text("📜 <b>Свод правил PARLIAMENT</b>", parse_mode="HTML", reply_markup=kb)
 
-# --- ШАГ 3: ПРАВИЛА -> ИНЛАЙН КНОПКА КАПЧИ ---
 @router.callback_query(LobbyStates.step_rules, F.data == "rules_accepted")
 async def process_rules(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(LobbyStates.step_captcha)
 
-    # Делаем кнопку капчи ИНЛАЙНОВЫМ ОБРАЗОМ под сообщением (без клавиатуры снизу)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🧩 Пройти проверку (Капча)", web_app=WebAppInfo(url=WEBAPP_URL))]
     ])
+    await callback.message.edit_text("✔️ <b>Возраст и правила подтверждены.</b> Нажмите кнопку ниже:", parse_mode="HTML", reply_markup=kb)
 
-    await callback.message.edit_text(
-        "✔️ <b>Возраст и правила подтверждены.</b>\n\n"
-        "🔒 Остался финальный шаг — нажмите кнопку ниже, чтобы пройти антибот-проверку:",
-        parse_mode="HTML",
-        reply_markup=kb
-    )
-
-# --- ШАГ 4: ОБРАБОТКА КАПЧИ И ВЫДАЧА ССЫЛКИ ---
-@router.message(LobbyStates.step_captcha, F.web_app_data)
+# --- ЛОВИМ ДАННЫЕ ИЗ WEBAPP БЕЗ СТРОГОЙ ПРОВЕРКИ СОСТОЯНИЯ (НАДЕЖНЕЕ) ---
+@router.message(F.web_app_data)
 async def process_captcha(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
+    logging.info(f"Получены данные из WebApp от юзера {user_id}: {message.web_app_data.data}")
+
     try:
         payload = json.loads(message.web_app_data.data)
-    except Exception:
-        await message.answer("⚠️ Ошибка чтения данных.")
+    except Exception as e:
+        logging.error(f"Ошибка парсинга JSON от WebApp: {e}")
+        await message.answer("⚠️ Ошибка чтения данных капчи.")
         return
 
     if payload.get("status") != "verified":
@@ -222,7 +192,7 @@ async def process_captcha(message: Message, state: FSMContext, bot: Bot):
         )
     except Exception as e:
         logging.error(f"Ошибка создания ссылки: {e}")
-        await message.answer("⚠️ Ошибка создания ссылки со стороны Telegram.")
+        await message.answer("⚠️ Ошибка создания ссылки со стороны Telegram (проверьте права админа у бота в чате).")
         return
 
     update_cooldown_db(user_id, now)
